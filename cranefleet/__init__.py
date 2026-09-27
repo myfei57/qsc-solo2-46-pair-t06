@@ -2,6 +2,7 @@
 
 from . import (
     audit,
+    authority,
     cluster,
     config,
     console,
@@ -21,6 +22,7 @@ from .wiring import App, build_app
 __all__ = [
     "App",
     "audit",
+    "authority",
     "build_app",
     "cluster",
     "config",

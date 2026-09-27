@@ -37,6 +37,47 @@ function setOnline(online) {
   node.classList.toggle("offline", !online);
 }
 
+const STATION_NAMES = { cab: "驾驶室", remote: "遥控器", "": "无人持权" };
+
+function stationName(station) {
+  return STATION_NAMES[station] || station || "无人持权";
+}
+
+function renderAuthority(authority) {
+  const holder = authority.holder || "";
+  const cards = $("authority-cards");
+  if (cards) {
+    cards.innerHTML = "";
+    const tone = authority.estopped ? "danger" : authority.active ? "ok" : "warn";
+    const value = authority.estopped
+      ? "急停锁定（" + stationName(authority.estopped_by) + "触发）"
+      : stationName(holder);
+    for (const [label, text, cardTone] of [
+      ["当前操纵端", value, tone],
+      ["待处理交接", authority.pending
+        ? stationName(authority.pending.requester) + " 申请接管"
+        : "无", authority.pending ? "warn" : ""],
+      ["交接序号", authority.sequence || 0],
+    ]) {
+      const card = document.createElement("div");
+      card.className = "card" + (cardTone ? " " + cardTone : "");
+      const labelNode = document.createElement("div");
+      labelNode.className = "label";
+      labelNode.textContent = label;
+      const valueNode = document.createElement("div");
+      valueNode.className = "value";
+      valueNode.textContent = String(text);
+      card.appendChild(labelNode);
+      card.appendChild(valueNode);
+      cards.appendChild(card);
+    }
+  }
+  const node = $("authority-data");
+  if (node) {
+    node.textContent = JSON.stringify(authority, null, 2);
+  }
+}
+
 async function refresh() {
   let state;
   try {
@@ -54,6 +95,8 @@ async function refresh() {
   const limit = data.limit || {};
   const cluster = data.cluster || {};
   const pair = cluster.nearest_pair || {};
+  const authority = (data.authority && data.authority.cranes && data.authority.cranes["crane-1"]) || {};
+  renderAuthority(authority);
   renderCards([
     ["塔吊数量", Object.keys(cluster.positions || {}).length],
     ["分区占用", (zone.occupants || []).length, zone.conflict ? "danger" : ""],
@@ -94,6 +137,40 @@ $("survey-btn").addEventListener("click", async () => {
 
 $("reset-crane-btn").addEventListener("click", async () => {
   await post("/api/crane/reset");
+  refresh();
+});
+
+function station() {
+  return $("station-select").value;
+}
+
+$("auth-acquire-btn").addEventListener("click", async () => {
+  await post("/api/authority/acquire", { station: station() });
+  refresh();
+});
+
+$("auth-request-btn").addEventListener("click", async () => {
+  await post("/api/authority/request", { station: station() });
+  refresh();
+});
+
+$("auth-grant-btn").addEventListener("click", async () => {
+  await post("/api/authority/grant", { station: station() });
+  refresh();
+});
+
+$("auth-deny-btn").addEventListener("click", async () => {
+  await post("/api/authority/deny", { station: station() });
+  refresh();
+});
+
+$("auth-release-btn").addEventListener("click", async () => {
+  await post("/api/authority/release", { station: station() });
+  refresh();
+});
+
+$("estop-btn").addEventListener("click", async () => {
+  await post("/api/crane/estop", { source: station() });
   refresh();
 });
 

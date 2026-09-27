@@ -11,6 +11,7 @@ from . import config as site_config
 from . import slew as slew_module
 from . import zone as zone_module
 from .audit import Audit, AuditEntry
+from .authority import Authority
 from .cluster import Cluster
 from .console import Console
 from .crane import Crane
@@ -82,6 +83,7 @@ def build_app(data_dir: str = "data", web_root: str = "web") -> App:
     feedback = SpeedFeedback("crane-1")
     slew_module.restore_feedback(feedback, store)
     cranes = {"crane-1": Crane("crane-1")}
+    authorities = {"crane-1": Authority("crane-1")}
     config = site_config.load_config(store)
 
     console = Console(
@@ -95,6 +97,7 @@ def build_app(data_dir: str = "data", web_root: str = "web") -> App:
         limit=limit,
         audit=audit,
         cranes=cranes,
+        authorities=authorities,
         feedback=feedback,
         config=config,
         web_root=web_root,

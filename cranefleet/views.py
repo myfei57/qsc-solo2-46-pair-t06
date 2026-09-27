@@ -19,7 +19,6 @@ from .store import store_count, store_size
 if TYPE_CHECKING:
     from .console import Console
 
-
 def zone_view(console: "Console") -> dict[str, object]:
     zone = console.zone
     positions = fleet.current_positions(console.cluster)
@@ -167,13 +166,33 @@ def crane_view(console: "Console") -> dict[str, object]:
         "id": crane.id,
         "last_command": crane.last_command().to_dict(),
         "stops_pending": crane.stops_pending(),
+        "estop": crane.estop_active(),
         "sway_angle": console.load.sway_angle(),
         "momentum": console.load.momentum(),
         "load_height": console.load.height(),
         "command_sequence": crane.command_sequence(),
         "stop_sequence": crane.stop_sequence_now(),
         "blocked_moves": crane.blocked_moves_now(),
+        "authority": authority_for(console, crane.id),
     }
+
+
+def authority_for(console: "Console", crane_id: str) -> dict[str, object]:
+    authority = console.authorities.get(crane_id)
+    if authority is None:
+        return {}
+    return authority.state_snapshot()
+
+
+def authority_view(console: "Console") -> dict[str, object]:
+    """Authority state for every crane, newest ledger entries first."""
+
+    cranes: dict[str, object] = {}
+    for crane_id, authority in console.authorities.items():
+        snapshot = authority.state_snapshot()
+        snapshot["ledger"] = list(reversed(snapshot["ledger"]))  # type: ignore[arg-type]
+        cranes[crane_id] = snapshot
+    return {"cranes": cranes}
 
 
 def load_view(console: "Console") -> dict[str, object]:
@@ -201,6 +220,7 @@ def state_view(console: "Console") -> dict[str, object]:
         "limit": limit_view(console),
         "cluster": cluster_view(console),
         "crane": crane_view(console),
+        "authority": authority_view(console),
         "load": load_view(console),
         "config": config_view(console.config, console.cluster),
         "audit": console.audit.count(),

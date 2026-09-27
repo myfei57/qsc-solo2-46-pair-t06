@@ -80,6 +80,7 @@ class DispatchFlowTests(unittest.TestCase):
         self.assertFalse(self.console.slew.is_faulted())
 
     def test_hoist_and_trolley_flow(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
         dispatch(self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"})
         status, payload = dispatch(self.console, "GET", "/api/hoist/state")
         self.assertTrue(payload["data"]["hook_lowered"])
@@ -98,16 +99,157 @@ class DispatchFlowTests(unittest.TestCase):
         self.assertFalse(payload["data"]["moving"])
 
     def test_command_stop_priority(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
         dispatch(self.console, "POST", "/api/slew/start")
         dispatch(self.console, "POST", "/api/crane/command", {"source": "cab", "action": "stop"})
+        # A move arriving after the holder's stop stays merged behind the stop.
         status, payload = dispatch(
-            self.console, "POST", "/api/crane/command", {"source": "remote", "action": "swing", "angle": 30}
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "swing", "angle": 30}
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["action"], "stop")
         self.assertEqual(self.console.default_crane().blocked_moves_now(), ["swing"])
         dispatch(self.console, "POST", "/api/crane/reset")
         self.assertFalse(self.console.default_crane().stops_pending())
+
+    def test_non_holder_commands_are_rejected(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        status, payload = dispatch(
+            self.console,
+            "POST",
+            "/api/crane/command",
+            {"source": "remote", "action": "swing", "angle": 30},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("cab", payload["error"])
+        # The rejected command never reaches the merge/execute stage.
+        self.assertEqual(self.console.default_crane().last_command().action, "")
+        self.assertEqual(
+            self.console.default_crane().blocked_moves_now(), ["swing"]
+        )
+        # Nobody commanding at all is rejected as well.
+        dispatch(self.console, "POST", "/api/authority/release", {"station": "cab"})
+        status, payload = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"}
+        )
+        self.assertEqual(status, 403)
+
+    def test_explicit_handover_flow(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        # Remote asks; cab still owns the machine until it grants.
+        status, payload = dispatch(
+            self.console, "POST", "/api/authority/request", {"station": "remote"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["handshake"]["state"], "requested")
+        status, payload = dispatch(
+            self.console,
+            "POST",
+            "/api/crane/command",
+            {"source": "remote", "action": "lower"},
+        )
+        self.assertEqual(status, 403)
+        # Only the holder (cab) can grant; remote cannot self-grant.
+        status, _ = dispatch(self.console, "POST", "/api/authority/grant", {"station": "remote"})
+        self.assertEqual(status, 409)
+        status, payload = dispatch(
+            self.console, "POST", "/api/authority/grant", {"station": "cab"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["holder"], "remote")
+        # After the grant the old station's commands are refused.
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"}
+        )
+        self.assertEqual(status, 403)
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "remote", "action": "lower"}
+        )
+        self.assertEqual(status, 200)
+        # The whole exchange is in the ledger, newest first on state.
+        status, payload = dispatch(self.console, "GET", "/api/authority/state")
+        ledger = payload["data"]["cranes"]["crane-1"]["ledger"]
+        states = [entry["state"] for entry in ledger]
+        self.assertEqual(states, ["granted", "requested", "granted"])
+
+    def test_handover_can_be_denied(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        dispatch(self.console, "POST", "/api/authority/request", {"station": "remote"})
+        status, payload = dispatch(
+            self.console,
+            "POST",
+            "/api/authority/deny",
+            {"station": "cab", "reason": "load airborne"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["holder"], "cab")
+        self.assertIsNone(payload["data"]["pending"])
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "remote", "action": "lower"}
+        )
+        self.assertEqual(status, 403)
+
+    def test_emergency_stop_overrides_authority(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        dispatch(self.console, "POST", "/api/slew/start")
+        dispatch(
+            self.console,
+            "POST",
+            "/api/crane/command",
+            {"source": "cab", "action": "swing", "angle": 20},
+        )
+        # Remote (non-holder) may fire the e-stop at any time.
+        status, payload = dispatch(
+            self.console, "POST", "/api/crane/estop", {"source": "remote"}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["estop"])
+        self.assertFalse(self.console.slew.is_moving())
+        self.assertFalse(self.console.trolley.is_moving())
+        self.assertTrue(self.console.hoist.brake_on())
+        authority = self.console.authorities["crane-1"]
+        self.assertTrue(authority.is_estopped())
+        self.assertEqual(authority.holder_now(), "")
+        # Neither side can command while the latch is held.
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"}
+        )
+        self.assertEqual(status, 409)
+        # Handover is frozen during the latch too.
+        status, _ = dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        self.assertEqual(status, 409)
+        # Reset clears the latch; control must then be explicitly re-acquired.
+        dispatch(self.console, "POST", "/api/crane/reset")
+        self.assertFalse(authority.is_estopped())
+        self.assertEqual(authority.holder_now(), "")
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"}
+        )
+        self.assertEqual(status, 403)
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"}
+        )
+        self.assertEqual(status, 200)
+        # The e-stop and its source are on the audit trail.
+        entries = {entry.action: entry.detail for entry in self.console.audit.snapshot()}
+        self.assertIn("emergency-stop", entries)
+        self.assertIn("station=remote", entries["emergency-stop"])
+        self.assertIn("emergency-reset", entries)
+
+    def test_release_freezes_motion_and_revokes_commands(self) -> None:
+        dispatch(self.console, "POST", "/api/authority/acquire", {"station": "cab"})
+        dispatch(self.console, "POST", "/api/slew/start")
+        status, _ = dispatch(self.console, "POST", "/api/authority/release", {"station": "cab"})
+        self.assertEqual(status, 200)
+        self.assertFalse(self.console.slew.is_moving())
+        status, _ = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "swing"}
+        )
+        self.assertEqual(status, 403)
+        # A non-holder cannot release.
+        status, _ = dispatch(self.console, "POST", "/api/authority/release", {"station": "remote"})
+        self.assertEqual(status, 409)
 
     def test_limit_check_and_target(self) -> None:
         dispatch(self.console, "POST", "/api/cluster/survey", {"cranes": {"crane-2": {"x": 0, "y": 150}}})

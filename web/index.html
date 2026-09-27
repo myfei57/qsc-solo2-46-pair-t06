@@ -27,11 +27,28 @@
     </section>
 
     <section id="page-cranes" class="hidden">
+      <h2>操纵权交接</h2>
+      <div class="actions authority-bar">
+        <label>本端身份
+          <select id="station-select">
+            <option value="cab">驾驶室</option>
+            <option value="remote">遥控器</option>
+          </select>
+        </label>
+        <button id="auth-acquire-btn">获取操纵权</button>
+        <button id="auth-request-btn">申请交接</button>
+        <button id="auth-grant-btn">同意交出</button>
+        <button id="auth-deny-btn">拒绝交接</button>
+        <button id="auth-release-btn">交还操纵权</button>
+        <button id="estop-btn" class="danger">紧急停止</button>
+      </div>
+      <div class="cards" id="authority-cards"></div>
+      <pre id="authority-data"></pre>
       <h2>机群坐标与基线</h2>
       <pre id="crane-data"></pre>
       <div class="actions">
         <button id="survey-btn">重新放线（±2 米）</button>
-        <button id="reset-crane-btn">解除指令锁定</button>
+        <button id="reset-crane-btn">急停复位</button>
       </div>
     </section>
 

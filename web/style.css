@@ -20,3 +20,8 @@ pre { background: #fff; border-radius: 10px; padding: 14px; white-space: pre-wra
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .actions button { background: #2f6fb0; color: #fff; border: 0; border-radius: 6px; padding: 9px 15px; cursor: pointer; font-size: 14px; }
 .actions button:active { background: #245486; }
+.card.ok .value { color: #1e8449; }
+.actions button.danger { background: #c0392b; }
+.actions button.danger:active { background: #922b21; }
+.authority-bar label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #334155; }
+.authority-bar select { padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }

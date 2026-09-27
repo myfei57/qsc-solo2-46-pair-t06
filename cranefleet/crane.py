@@ -14,6 +14,7 @@ SOURCE_CAB = "cab"
 SOURCE_REMOTE = "remote"
 
 ACTION_STOP = "stop"
+ACTION_EMERGENCY_STOP = "estop"
 ACTION_SWING = "swing"
 ACTION_TROLLEY = "trolley"
 ACTION_RAISE = "raise"
@@ -59,6 +60,7 @@ class Crane:
         self.id = crane_id
         self.cab_stop = False
         self.remote_stop = False
+        self.estop = False
         self.last = Command(source=SOURCE_CAB, action="")
         self.sequence = 0
         self.stop_sequence = 0
@@ -72,10 +74,18 @@ class Crane:
         with self._lock:
             return self.cab_stop or self.remote_stop
 
+    def estop_active(self) -> bool:
+        with self._lock:
+            return self.estop
+
     def clear_stop(self) -> None:
         with self._lock:
             self.cab_stop = False
             self.remote_stop = False
+
+    def clear_estop(self) -> None:
+        with self._lock:
+            self.estop = False
 
     def command_sequence(self) -> int:
         with self._lock:
@@ -128,6 +138,13 @@ def merge(crane: Crane, command: Command) -> Command:
     with crane._lock:  # noqa: SLF001 - module-level functions share crane state
         crane.sequence += 1
         sequence = crane.sequence
+        if command.action == ACTION_EMERGENCY_STOP:
+            crane.estop = True
+            crane.cab_stop = True
+            crane.remote_stop = True
+            crane.stop_sequence = sequence
+            crane.last = command
+            return command
         if command.action == ACTION_STOP:
             if command.source == SOURCE_CAB:
                 crane.cab_stop = True
@@ -136,6 +153,9 @@ def merge(crane: Crane, command: Command) -> Command:
             crane.stop_sequence = sequence
             crane.last = command
             return command
+        if crane.estop:
+            crane.blocked_moves.append(command.action)
+            return crane.last
         if crane.cab_stop or crane.remote_stop:
             crane.blocked_moves.append(command.action)
             return crane.last
@@ -161,7 +181,12 @@ def execute(
     """Execute the currently merged command against the machine modules."""
 
     command = crane.last_command()
-    if command.action == ACTION_STOP:
+    if command.action == ACTION_EMERGENCY_STOP:
+        # E-stop acts on every axis regardless of the axis field on the order.
+        slew_stop(slew, recorder)
+        trolley_stop(trolley, recorder)
+        hoist_stop(hoist, recorder)
+    elif command.action == ACTION_STOP:
         if command.axis == AXIS_TROLLEY:
             trolley_stop(trolley, recorder)
         elif command.axis == AXIS_HOIST:

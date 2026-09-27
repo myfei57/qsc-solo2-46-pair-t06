@@ -21,20 +21,28 @@ from . import trolley as trolley_module
 from . import views
 from . import wind as wind_module
 from . import zone as zone_module
+from . import authority as authority_module
 from .audit import Audit
+from .authority import Authority
 from .cluster import Cluster
 from .config import ConfigError, SiteConfig
 from .crane import Crane
 from .errors import (
+    AuthorityHeldElsewhere,
     CraneFleetError,
+    EmergencyStopActive,
     FeedbackNotConfirmed,
+    HandoverPending,
     HoistBusy,
     HookNotLowered,
+    NotHolder,
+    NotRequester,
     SlewBlocked,
     SlewBusy,
     SlewIdle,
     SlewStopNotAcknowledged,
     StoreError,
+    UnknownStation,
     ZoneNotDurable,
 )
 from .hoist import Drum, Hoist
@@ -93,6 +101,7 @@ class Console:
         limit: Limit,
         audit: Audit,
         cranes: dict[str, Crane],
+        authorities: dict[str, Authority],
         feedback: SpeedFeedback,
         config: SiteConfig,
         web_root: str = "web",
@@ -107,6 +116,7 @@ class Console:
         self.limit = limit
         self.audit = audit
         self.cranes = cranes
+        self.authorities = authorities
         self.feedback = feedback
         self.config = config
         self.web_root = web_root
@@ -130,9 +140,17 @@ class Console:
             ("POST", "/api/wind/alarm"): self.handle_wind_alarm,
             ("POST", "/api/wind/clear"): self.handle_wind_clear,
             ("POST", "/api/crane/command"): self.handle_crane_command,
+            ("POST", "/api/crane/estop"): self.handle_crane_estop,
             ("GET", "/api/crane/state"): self.handle_crane_state,
             ("GET", "/api/crane/load"): self.handle_crane_load,
             ("POST", "/api/crane/reset"): self.handle_crane_reset,
+            ("GET", "/api/authority/state"): self.handle_authority_state,
+            ("POST", "/api/authority/acquire"): self.handle_authority_acquire,
+            ("POST", "/api/authority/request"): self.handle_authority_request,
+            ("POST", "/api/authority/grant"): self.handle_authority_grant,
+            ("POST", "/api/authority/deny"): self.handle_authority_deny,
+            ("POST", "/api/authority/release"): self.handle_authority_release,
+            ("GET", "/api/authority/ledger"): self.handle_authority_ledger,
             ("GET", "/api/trolley/state"): self.handle_trolley_state,
             ("POST", "/api/trolley/resume"): self.handle_trolley_resume,
             ("GET", "/api/hoist/state"): self.handle_hoist_state,
@@ -158,6 +176,11 @@ class Console:
         if not crane_id:
             return self.default_crane()
         return self.cranes.get(crane_id)
+
+    def authority(self, crane_id: str) -> Authority | None:
+        if not crane_id:
+            return self.authorities.get("crane-1")
+        return self.authorities.get(crane_id)
 
     def dispatch(self, request: Request) -> tuple[int, dict[str, Any]]:
         handler = self._routes.get((request.method, request.path))
@@ -308,11 +331,22 @@ class Console:
         crane = self.crane(str(request.body.get("crane_id") or ""))
         if crane is None:
             return 404, fail("crane not found")
+        authority = self.authorities[crane.id]
         command = crane_module.Command.from_dict(request.body)
-        if command.source == crane_module.SOURCE_REMOTE:
-            crane_module.apply_remote(crane, command)
-        else:
-            crane_module.apply_cab(crane, command)
+        try:
+            authority_module.ensure_in_control(authority, command.source)
+        except EmergencyStopActive:
+            return 409, fail("emergency stop active")
+        except AuthorityHeldElsewhere as exc:
+            with crane._lock:  # noqa: SLF001 - console shares crane state
+                crane.blocked_moves.append(command.action)
+            self.audit.record(
+                crane.id,
+                "command-rejected",
+                f"source={command.source} action={command.action} holder={authority.holder_now() or 'none'}",
+            )
+            return 403, fail(str(exc))
+        crane_module.merge(crane, command)
         self._book_keeping(command)
         try:
             crane_module.execute(crane, self.slew, self.trolley, self.hoist, self.audit)
@@ -329,6 +363,38 @@ class Console:
                 LOGGER.debug("best-effort hoist persist skipped after lower: %s", exc)
         return 200, ok(crane.last_command().to_dict())
 
+    def handle_crane_estop(self, request: Request) -> tuple[int, dict[str, Any]]:
+        """Emergency stop from either station; it never needs authority."""
+
+        if not request.body_valid:
+            return 400, fail("bad request")
+        crane = self.crane(str(request.body.get("crane_id") or ""))
+        if crane is None:
+            return 404, fail("crane not found")
+        authority = self.authorities[crane.id]
+        source = str(request.body.get("source") or "")
+        try:
+            authority_module.validate_station(source)
+        except UnknownStation:
+            return 400, fail("source must be cab or remote")
+        authority_module.emergency_stop(authority, source, self.audit)
+        command = crane_module.Command(
+            source=source, action=crane_module.ACTION_EMERGENCY_STOP
+        )
+        crane_module.merge(crane, command)
+        self._freeze_motion()
+        self._book_keeping(command)
+        return 200, ok(views.crane_view(self))
+
+    def _freeze_motion(self) -> None:
+        """Stop every axis and hold the hoist brake (used by e-stop/handover)."""
+
+        slew_module.stop(self.slew, self.audit)
+        trolley_module.stop(self.trolley, self.audit)
+        hoist_module.stop(self.hoist, self.audit)
+        hoist_module.engage_brake(self.hoist)
+        self.ramp.set_target(0.0)
+
     def _book_keeping(self, command: crane_module.Command) -> None:
         if command.action == crane_module.ACTION_SWING:
             self.ramp.set_target(command.angle)
@@ -338,7 +404,10 @@ class Console:
             self.load.set_vertical(8.0)
         elif command.action == crane_module.ACTION_TROLLEY:
             self.speedometer.sample(self.trolley.position_now(), 0.5)
-        elif command.action == crane_module.ACTION_STOP:
+        elif command.action in (
+            crane_module.ACTION_STOP,
+            crane_module.ACTION_EMERGENCY_STOP,
+        ):
             self.ramp.set_target(0.0)
             self.load.update(-0.2, 0.1)
 
@@ -353,9 +422,114 @@ class Console:
         if crane is None:
             return 404, fail("crane not found")
         crane.clear_stop()
+        crane.clear_estop()
+        authority_module.reset(self.authorities[crane.id], self.audit)
         limit_module.reset_arbitration(self.limit)
-        self.audit.record(crane.id, "command-reset", "stops cleared")
+        self.audit.record(crane.id, "command-reset", "stops and e-stop cleared")
         return 200, ok(crane.last_command().to_dict())
+
+    # --------------------------------------------------------------- authority
+
+    def _station_context(
+        self, request: Request
+    ) -> tuple[Crane, Authority, str] | tuple[int, dict[str, Any]]:
+        if not request.body_valid:
+            return 400, fail("bad request")
+        crane = self.crane(str(request.body.get("crane_id") or ""))
+        if crane is None:
+            return 404, fail("crane not found")
+        station = str(request.body.get("station") or "")
+        if station not in authority_module.STATIONS:
+            return 400, fail("station must be cab or remote")
+        return crane, self.authorities[crane.id], station
+
+    @staticmethod
+    def _is_error(
+        resolved: tuple[Crane, Authority, str] | tuple[int, dict[str, Any]],
+    ) -> bool:
+        return isinstance(resolved[0], int)
+
+    def handle_authority_state(self, request: Request) -> tuple[int, dict[str, Any]]:
+        return 200, ok(views.authority_view(self))
+
+    def handle_authority_acquire(self, request: Request) -> tuple[int, dict[str, Any]]:
+        resolved = self._station_context(request)
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return resolved  # type: ignore[return-value]
+        crane, authority, station = resolved
+        try:
+            authority_module.acquire(authority, station, self.audit)
+        except EmergencyStopActive:
+            return 409, fail("emergency stop active; reset first")
+        except AuthorityHeldElsewhere as exc:
+            return 409, fail(str(exc))
+        except HandoverPending:
+            return 409, fail("handover request pending")
+        return 200, ok(views.authority_for(self, crane.id))
+
+    def handle_authority_request(self, request: Request) -> tuple[int, dict[str, Any]]:
+        resolved = self._station_context(request)
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return resolved  # type: ignore[return-value]
+        crane, authority, station = resolved
+        try:
+            entry = authority_module.request_handover(authority, station, self.audit)
+        except EmergencyStopActive:
+            return 409, fail("emergency stop active")
+        except AuthorityHeldElsewhere as exc:
+            # Nobody holds it: acquire directly for the requester.
+            authority_module.acquire(authority, station, self.audit)
+            return 200, ok(views.authority_for(self, crane.id))
+        except HandoverPending as exc:
+            return 409, fail(str(exc))
+        return 200, ok(
+            {"handshake": entry.to_dict(), "authority": views.authority_for(self, crane.id)}
+        )
+
+    def handle_authority_grant(self, request: Request) -> tuple[int, dict[str, Any]]:
+        resolved = self._station_context(request)
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return resolved  # type: ignore[return-value]
+        crane, authority, station = resolved
+        try:
+            authority_module.grant_handover(authority, station, self.audit)
+        except EmergencyStopActive:
+            return 409, fail("emergency stop active")
+        except (NotHolder, NotRequester) as exc:
+            return 409, fail(str(exc))
+        # Handing over is a zero-motion boundary: nothing keeps moving under
+        # the outgoing station once the new station owns the machine.
+        self._freeze_motion()
+        return 200, ok(views.authority_for(self, crane.id))
+
+    def handle_authority_deny(self, request: Request) -> tuple[int, dict[str, Any]]:
+        resolved = self._station_context(request)
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return resolved  # type: ignore[return-value]
+        crane, authority, station = resolved
+        reason = str(request.body.get("reason") or "")
+        try:
+            authority_module.deny_handover(authority, station, reason, self.audit)
+        except (NotHolder, NotRequester) as exc:
+            return 409, fail(str(exc))
+        return 200, ok(views.authority_for(self, crane.id))
+
+    def handle_authority_release(self, request: Request) -> tuple[int, dict[str, Any]]:
+        resolved = self._station_context(request)
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return resolved  # type: ignore[return-value]
+        crane, authority, station = resolved
+        try:
+            authority_module.release(authority, station, self.audit)
+        except EmergencyStopActive:
+            return 409, fail("emergency stop active")
+        except NotHolder as exc:
+            return 409, fail(str(exc))
+        self._freeze_motion()
+        return 200, ok(views.authority_for(self, crane.id))
+
+    def handle_authority_ledger(self, request: Request) -> tuple[int, dict[str, Any]]:
+        return 200, ok(views.authority_view(self))
 
     # -------------------------------------------------------- trolley / hoist
 
