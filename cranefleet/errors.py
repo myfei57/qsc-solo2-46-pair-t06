@@ -89,3 +89,35 @@ class StaleRelease(LimitError):
 
 class ConfigError(CraneFleetError):
     """Raised when a site configuration payload is invalid."""
+
+
+class AuthorityError(CraneFleetError):
+    """Base class for control-station arbitration failures."""
+
+
+class UnknownStation(AuthorityError):
+    """Raised when a request names a station other than cab or remote."""
+
+
+class StationNotHolder(AuthorityError):
+    """Raised when a non-holder station issues a motion command."""
+
+
+class AuthorityIdle(AuthorityError):
+    """Raised when a handover is completed while nobody holds the station."""
+
+
+class AuthorityHeldByOther(AuthorityError):
+    """Raised when a station tries to take authority already granted elsewhere."""
+
+
+class NoPendingHandover(AuthorityError):
+    """Raised when an accept/reject/cancel finds no offered handover."""
+
+
+class HandoverOfferedByOther(AuthorityError):
+    """Raised when a handover is accepted or rejected by the wrong station."""
+
+
+class EmergencyStopActive(AuthorityError):
+    """Raised when motion is ordered while an emergency stop is latched."""

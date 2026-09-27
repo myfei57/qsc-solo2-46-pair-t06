@@ -11,6 +11,7 @@
     <h1>CraneFleet 塔吊机群控制台</h1>
     <nav id="nav">
       <button data-page="overview" class="active">总览</button>
+      <button data-page="control">操纵权</button>
       <button data-page="cranes">机群</button>
       <button data-page="zones">防碰撞区</button>
       <button data-page="hoist">吊装</button>
@@ -24,6 +25,39 @@
       <div class="cards" id="overview-cards"></div>
       <h2>最近动作</h2>
       <pre id="overview-log"></pre>
+    </section>
+
+    <section id="page-control" class="hidden">
+      <h2>操纵端交接</h2>
+      <div class="cards" id="control-cards"></div>
+      <pre id="control-data"></pre>
+      <p id="control-message" class="control-message"></p>
+      <div class="actions">
+        <button id="ctl-take-cab-btn">驾驶室接管</button>
+        <button id="ctl-take-remote-btn">遥控器接管</button>
+        <button id="ctl-offer-cab-btn">驾驶室交出（等待遥控器）</button>
+        <button id="ctl-offer-remote-btn">遥控器交出（等待驾驶室）</button>
+        <button id="ctl-accept-cab-btn">驾驶室接受交接</button>
+        <button id="ctl-accept-remote-btn">遥控器接受交接</button>
+        <button id="ctl-reject-cab-btn">驾驶室拒绝</button>
+        <button id="ctl-reject-remote-btn">遥控器拒绝</button>
+        <button id="ctl-cancel-btn">撤销交接</button>
+        <button id="ctl-release-cab-btn">驾驶室释放</button>
+        <button id="ctl-release-remote-btn">遥控器释放</button>
+      </div>
+      <h2>指令验证（非操纵端指令应被拒绝）</h2>
+      <div class="actions">
+        <button id="ctl-cab-lower-btn">驾驶室：落钩</button>
+        <button id="ctl-remote-lower-btn">遥控器：落钩</button>
+      </div>
+      <h2>紧急停止</h2>
+      <div class="actions">
+        <button id="ctl-estop-cab-btn" class="danger">驾驶室急停</button>
+        <button id="ctl-estop-remote-btn" class="danger">遥控器急停</button>
+        <button id="ctl-reset-btn">急停复位</button>
+      </div>
+      <h2>交接与急停审计</h2>
+      <pre id="control-audit"></pre>
     </section>
 
     <section id="page-cranes" class="hidden">

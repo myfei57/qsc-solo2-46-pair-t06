@@ -14,6 +14,7 @@ from typing import Any, Callable
 from . import cluster as fleet
 from . import config as site_config
 from . import crane as crane_module
+from . import authority as authority_module
 from . import hoist as hoist_module
 from . import limit as limit_module
 from . import slew as slew_module
@@ -22,11 +23,14 @@ from . import views
 from . import wind as wind_module
 from . import zone as zone_module
 from .audit import Audit
+from .authority import ControlAuthority
 from .cluster import Cluster
 from .config import ConfigError, SiteConfig
 from .crane import Crane
 from .errors import (
+    AuthorityError,
     CraneFleetError,
+    EmergencyStopActive,
     FeedbackNotConfirmed,
     HoistBusy,
     HookNotLowered,
@@ -34,7 +38,9 @@ from .errors import (
     SlewBusy,
     SlewIdle,
     SlewStopNotAcknowledged,
+    StationNotHolder,
     StoreError,
+    UnknownStation,
     ZoneNotDurable,
 )
 from .hoist import Drum, Hoist
@@ -93,6 +99,7 @@ class Console:
         limit: Limit,
         audit: Audit,
         cranes: dict[str, Crane],
+        authorities: dict[str, ControlAuthority],
         feedback: SpeedFeedback,
         config: SiteConfig,
         web_root: str = "web",
@@ -107,6 +114,7 @@ class Console:
         self.limit = limit
         self.audit = audit
         self.cranes = cranes
+        self.authorities = authorities
         self.feedback = feedback
         self.config = config
         self.web_root = web_root
@@ -133,6 +141,15 @@ class Console:
             ("GET", "/api/crane/state"): self.handle_crane_state,
             ("GET", "/api/crane/load"): self.handle_crane_load,
             ("POST", "/api/crane/reset"): self.handle_crane_reset,
+            ("GET", "/api/control/state"): self.handle_control_state,
+            ("POST", "/api/control/take"): self.handle_control_take,
+            ("POST", "/api/control/offer"): self.handle_control_offer,
+            ("POST", "/api/control/accept"): self.handle_control_accept,
+            ("POST", "/api/control/reject"): self.handle_control_reject,
+            ("POST", "/api/control/cancel"): self.handle_control_cancel,
+            ("POST", "/api/control/release"): self.handle_control_release,
+            ("POST", "/api/control/estop"): self.handle_control_estop,
+            ("POST", "/api/control/reset"): self.handle_control_reset,
             ("GET", "/api/trolley/state"): self.handle_trolley_state,
             ("POST", "/api/trolley/resume"): self.handle_trolley_resume,
             ("GET", "/api/hoist/state"): self.handle_hoist_state,
@@ -153,6 +170,14 @@ class Console:
 
     def default_crane(self) -> Crane | None:
         return self.cranes.get("crane-1")
+
+    def default_authority(self) -> ControlAuthority | None:
+        return self.authorities.get("crane-1")
+
+    def authority_for(self, crane_id: str) -> ControlAuthority | None:
+        if not crane_id:
+            return self.default_authority()
+        return self.authorities.get(crane_id)
 
     def crane(self, crane_id: str) -> Crane | None:
         if not crane_id:
@@ -309,6 +334,20 @@ class Console:
         if crane is None:
             return 404, fail("crane not found")
         command = crane_module.Command.from_dict(request.body)
+        if command.source not in (crane_module.SOURCE_CAB, crane_module.SOURCE_REMOTE):
+            return 400, fail("source must be cab or remote")
+        authority = self.authority_for(crane.id)
+        if command.action == crane_module.ACTION_ESTOP:
+            return self._apply_emergency_stop(crane, authority, command)
+        if authority is not None:
+            try:
+                authority_module.admit(authority, command.source, command.action)
+            except EmergencyStopActive as exc:
+                return 409, fail(str(exc))
+            except StationNotHolder as exc:
+                return 409, fail(str(exc))
+            except UnknownStation as exc:
+                return 400, fail(str(exc))
         if command.source == crane_module.SOURCE_REMOTE:
             crane_module.apply_remote(crane, command)
         else:
@@ -329,6 +368,31 @@ class Console:
                 LOGGER.debug("best-effort hoist persist skipped after lower: %s", exc)
         return 200, ok(crane.last_command().to_dict())
 
+    def _apply_emergency_stop(
+        self,
+        crane: Crane,
+        authority: ControlAuthority | None,
+        command: crane_module.Command,
+    ) -> tuple[int, dict[str, Any]]:
+        """Honour an estop from either station regardless of who holds control."""
+
+        if authority is not None:
+            authority_module.trigger_estop(authority, command.source, self.audit)
+            try:
+                authority_module.persist(authority, self.store)
+            except StoreError as exc:
+                return 500, fail(str(exc))
+        if command.source == crane_module.SOURCE_REMOTE:
+            crane_module.apply_remote(crane, command)
+        else:
+            crane_module.apply_cab(crane, command)
+        self._book_keeping(command)
+        crane_module.execute_estop(crane, self.slew, self.trolley, self.hoist, self.audit)
+        data: dict[str, Any] = dict(crane.last_command().to_dict())
+        if authority is not None:
+            data["authority"] = views.authority_view(authority)
+        return 200, ok(data)
+
     def _book_keeping(self, command: crane_module.Command) -> None:
         if command.action == crane_module.ACTION_SWING:
             self.ramp.set_target(command.angle)
@@ -338,7 +402,7 @@ class Console:
             self.load.set_vertical(8.0)
         elif command.action == crane_module.ACTION_TROLLEY:
             self.speedometer.sample(self.trolley.position_now(), 0.5)
-        elif command.action == crane_module.ACTION_STOP:
+        elif command.action in (crane_module.ACTION_STOP, crane_module.ACTION_ESTOP):
             self.ramp.set_target(0.0)
             self.load.update(-0.2, 0.1)
 
@@ -354,8 +418,155 @@ class Console:
             return 404, fail("crane not found")
         crane.clear_stop()
         limit_module.reset_arbitration(self.limit)
+        authority = self.default_authority()
+        if authority is not None and authority.estop_active():
+            station = str(request.body.get("source") or authority.holder_now() or "system")
+            if station in authority_module.STATIONS:
+                authority_module.clear_estop(authority, station, self.audit)
+                try:
+                    authority_module.persist(authority, self.store)
+                except StoreError as exc:
+                    LOGGER.debug("best-effort authority persist skipped after reset: %s", exc)
         self.audit.record(crane.id, "command-reset", "stops cleared")
         return 200, ok(crane.last_command().to_dict())
+
+    # --------------------------------------------------------------- control
+
+    def handle_control_state(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority = self.authority_for(str(request.query_first("crane_id") or ""))
+        if authority is None:
+            return 404, fail("crane not found")
+        return 200, ok(views.authority_view(authority))
+
+    def handle_control_take(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            authority_module.take(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        except AuthorityError as exc:
+            return 409, fail(str(exc))
+        return self._persist_authority(authority)
+
+    def handle_control_offer(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            authority_module.offer(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        except AuthorityError as exc:
+            return 409, fail(str(exc))
+        # A pending offer is intentionally not persisted.
+        return 200, ok(views.authority_view(authority))
+
+    def handle_control_accept(self, request: Request) -> tuple[int, dict[str, Any]]:
+        return self._complete_handover(request, authority_module.accept_handover)
+
+    def handle_control_reject(self, request: Request) -> tuple[int, dict[str, Any]]:
+        return self._complete_handover(request, authority_module.reject_handover)
+
+    def handle_control_cancel(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            authority_module.cancel_handover(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        except AuthorityError as exc:
+            return 409, fail(str(exc))
+        return 200, ok(views.authority_view(authority))
+
+    def handle_control_release(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            authority_module.release(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        except AuthorityError as exc:
+            return 409, fail(str(exc))
+        return self._persist_authority(authority)
+
+    def handle_control_estop(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            authority_module.trigger_estop(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        crane = self.crane(str(request.body.get("crane_id") or ""))
+        if crane is not None:
+            command = crane_module.Command(source=station, action=crane_module.ACTION_ESTOP)
+            if station == crane_module.SOURCE_REMOTE:
+                crane_module.apply_remote(crane, command)
+            else:
+                crane_module.apply_cab(crane, command)
+            self._book_keeping(command)
+            crane_module.execute_estop(crane, self.slew, self.trolley, self.hoist, self.audit)
+        return self._persist_authority(authority)
+
+    def handle_control_reset(self, request: Request) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            authority_module.clear_estop(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        crane = self.crane(str(request.body.get("crane_id") or ""))
+        if crane is not None:
+            crane.clear_stop()
+        return self._persist_authority(authority)
+
+    def _complete_handover(
+        self,
+        request: Request,
+        finalize: Callable[[ControlAuthority, str, Audit], object],
+    ) -> tuple[int, dict[str, Any]]:
+        authority, station, status, failure = self._control_request(request)
+        if authority is None:
+            return status, failure  # type: ignore[return-value]
+        try:
+            finalize(authority, station, self.audit)
+        except UnknownStation as exc:
+            return 400, fail(str(exc))
+        except AuthorityError as exc:
+            return 409, fail(str(exc))
+        return self._persist_authority(authority)
+
+    def _control_request(
+        self, request: Request
+    ) -> tuple[
+        ControlAuthority | None,
+        str,
+        int,
+        dict[str, Any],
+    ]:
+        if not request.body_valid:
+            return None, "", 400, fail("bad request")
+        authority = self.authority_for(str(request.body.get("crane_id") or ""))
+        if authority is None:
+            return None, "", 404, fail("crane not found")
+        station = str(request.body.get("station") or "")
+        if station not in authority_module.STATIONS:
+            return None, station, 400, fail("station must be cab or remote")
+        return authority, station, 0, {}
+
+    def _persist_authority(
+        self, authority: ControlAuthority
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            authority_module.persist(authority, self.store)
+        except StoreError as exc:
+            return 500, fail(str(exc))
+        return 200, ok(views.authority_view(authority))
 
     # -------------------------------------------------------- trolley / hoist
 

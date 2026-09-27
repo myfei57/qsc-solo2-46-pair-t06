@@ -14,6 +14,7 @@ SOURCE_CAB = "cab"
 SOURCE_REMOTE = "remote"
 
 ACTION_STOP = "stop"
+ACTION_ESTOP = "estop"
 ACTION_SWING = "swing"
 ACTION_TROLLEY = "trolley"
 ACTION_RAISE = "raise"
@@ -128,7 +129,7 @@ def merge(crane: Crane, command: Command) -> Command:
     with crane._lock:  # noqa: SLF001 - module-level functions share crane state
         crane.sequence += 1
         sequence = crane.sequence
-        if command.action == ACTION_STOP:
+        if command.action in (ACTION_STOP, ACTION_ESTOP):
             if command.source == SOURCE_CAB:
                 crane.cab_stop = True
             else:
@@ -177,3 +178,17 @@ def execute(
     elif command.action == ACTION_LOWER:
         hoist_lower(hoist)
     return command
+
+
+def execute_estop(
+    crane: Crane,
+    slew: Slew,
+    trolley: Trolley,
+    hoist: Hoist,
+    recorder: Audit | None = None,
+) -> None:
+    """Bring every axis to a stop for an emergency-stop command."""
+
+    slew_stop(slew, recorder)
+    trolley_stop(trolley, recorder)
+    hoist_stop(hoist, recorder)

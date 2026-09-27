@@ -12,6 +12,7 @@ from . import cluster as fleet
 from . import limit as limit_module
 from . import slew as slew_module
 from . import zone as zone_module
+from .authority import ControlAuthority
 from .config import config_view
 from .geometry import compute_separation
 from .store import store_count, store_size
@@ -163,6 +164,7 @@ def crane_view(console: "Console") -> dict[str, object]:
     crane = console.default_crane()
     if crane is None:
         return {}
+    authority = console.default_authority()
     return {
         "id": crane.id,
         "last_command": crane.last_command().to_dict(),
@@ -173,6 +175,19 @@ def crane_view(console: "Console") -> dict[str, object]:
         "command_sequence": crane.command_sequence(),
         "stop_sequence": crane.stop_sequence_now(),
         "blocked_moves": crane.blocked_moves_now(),
+        "authority": authority_view(authority) if authority is not None else None,
+    }
+
+
+def authority_view(authority: ControlAuthority) -> dict[str, object]:
+    pending = authority.pending_handover()
+    return {
+        "crane_id": authority.crane_id,
+        "holder": authority.holder_now(),
+        "estop": authority.estop_active(),
+        "estop_source": authority.estop_source_now(),
+        "pending_handover": pending.to_dict() if pending else None,
+        "generation": authority.generation_now(),
     }
 
 
@@ -192,6 +207,7 @@ def state_view(console: "Console") -> dict[str, object]:
         "zone-conflict"
     )
     latest_wind_stop = console.audit.latest("wind-slew-stop")
+    authority = console.default_authority()
     return {
         "zone": zone_view(console),
         "slew": slew_view(console),
@@ -201,6 +217,7 @@ def state_view(console: "Console") -> dict[str, object]:
         "limit": limit_view(console),
         "cluster": cluster_view(console),
         "crane": crane_view(console),
+        "control": authority_view(authority) if authority is not None else None,
         "load": load_view(console),
         "config": config_view(console.config, console.cluster),
         "audit": console.audit.count(),
@@ -212,6 +229,7 @@ def state_view(console: "Console") -> dict[str, object]:
 
 
 __all__ = [
+    "authority_view",
     "cluster_view",
     "crane_view",
     "hoist_view",

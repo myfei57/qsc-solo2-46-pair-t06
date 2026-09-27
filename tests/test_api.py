@@ -80,7 +80,11 @@ class DispatchFlowTests(unittest.TestCase):
         self.assertFalse(self.console.slew.is_faulted())
 
     def test_hoist_and_trolley_flow(self) -> None:
-        dispatch(self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"})
+        dispatch(self.console, "POST", "/api/control/take", {"station": "cab"})
+        status, payload = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "lower"}
+        )
+        self.assertEqual(status, 200)
         status, payload = dispatch(self.console, "GET", "/api/hoist/state")
         self.assertTrue(payload["data"]["hook_lowered"])
         status, payload = dispatch(self.console, "POST", "/api/hoist/release")
@@ -98,10 +102,21 @@ class DispatchFlowTests(unittest.TestCase):
         self.assertFalse(payload["data"]["moving"])
 
     def test_command_stop_priority(self) -> None:
+        dispatch(self.console, "POST", "/api/control/take", {"station": "cab"})
         dispatch(self.console, "POST", "/api/slew/start")
         dispatch(self.console, "POST", "/api/crane/command", {"source": "cab", "action": "stop"})
+        # The remote is not the holder: its move is refused before it can be
+        # merged, so the two ends can never fight over a live command.
         status, payload = dispatch(
             self.console, "POST", "/api/crane/command", {"source": "remote", "action": "swing", "angle": 30}
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("held by", payload["error"])
+        self.assertEqual(self.console.default_crane().blocked_moves_now(), [])
+        # A move from the holder while its own stop is pending is still merged
+        # into the stop (existing stop-priority rule).
+        status, payload = dispatch(
+            self.console, "POST", "/api/crane/command", {"source": "cab", "action": "swing", "angle": 30}
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["action"], "stop")
